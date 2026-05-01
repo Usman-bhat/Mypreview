@@ -1,0 +1,291 @@
+{
+  "name": "inside-editor-preview-docs",
+  "displayName": "Inside Editor Browser + Docs",
+  "description": "CDP-backed browser workbench with element picking, AI context export, and provider-agnostic docs search.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "license": "MIT",
+  "files": [
+    "out/**",
+    "media/**",
+    "mcp-server/**",
+    "README.md",
+    "LICENSE",
+    "package.json"
+  ],
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "myPreview.open",
+        "title": "My Preview: Open Browser Workbench"
+      },
+      {
+        "command": "myPreview.openFromSelection",
+        "title": "Open in Built-in Browser (My Preview)"
+      },
+      {
+        "command": "myPreview.focus",
+        "title": "My Preview: Focus Browser Workbench"
+      },
+      {
+        "command": "myPreview.pinCurrent",
+        "title": "My Preview: Pin Current Browser Panel"
+      },
+      {
+        "command": "myPreview.goBack",
+        "title": "My Preview: Back"
+      },
+      {
+        "command": "myPreview.goForward",
+        "title": "My Preview: Forward"
+      },
+      {
+        "command": "myPreview.reload",
+        "title": "My Preview: Reload"
+      },
+      {
+        "command": "myPreview.hardReload",
+        "title": "My Preview: Hard Reload"
+      },
+      {
+        "command": "myPreview.copyUrl",
+        "title": "My Preview: Copy URL"
+      },
+      {
+        "command": "myPreview.openExternal",
+        "title": "My Preview: Open In External Browser"
+      },
+      {
+        "command": "myPreview.togglePickMode",
+        "title": "My Preview: Toggle Pick Mode"
+      },
+      {
+        "command": "myPreview.copyContextForAI",
+        "title": "My Preview: Copy Context For AI"
+      },
+      {
+        "command": "myPreview.clearSelections",
+        "title": "My Preview: Clear Selected Elements"
+      },
+      {
+        "command": "myDocs.search",
+        "title": "My Docs: Search Docs Or Web"
+      },
+      {
+        "command": "myDocs.searchInDocs",
+        "title": "My Docs: Search In Specific Docs"
+      },
+      {
+        "command": "myDocs.openChat",
+        "title": "My Docs: Open Docs Chat"
+      },
+      {
+        "command": "myPreview.showBrowserBridgeSetup",
+        "title": "My Preview: Browser Bridge & MCP Setup"
+      },
+      {
+        "command": "myPreview.showDiagnostics",
+        "title": "My Preview: Show Diagnostics"
+      },
+      {
+        "command": "myPreview.cleanupBrowserProfiles",
+        "title": "My Preview: Cleanup Browser Profiles"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "myPreview.openFromSelection",
+          "group": "navigation",
+          "when": "editorHasSelection || editorTextFocus"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "myPreview.open",
+          "when": "view == myPreview.actions",
+          "group": "navigation"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "myPreviewExplorer",
+          "title": "My Preview",
+          "icon": "$(browser)"
+        }
+      ]
+    },
+    "views": {
+      "myPreviewExplorer": [
+        {
+          "id": "myPreview.actions",
+          "name": "Browser Actions",
+          "type": "tree"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "My Preview And Docs",
+      "properties": {
+        "myDocs.searchEndpoint": {
+          "type": "string",
+          "default": "http://127.0.0.1:47831/search",
+          "description": "Search API endpoint. The extension sends q, sourceName, and sourceBaseUrl query parameters by default."
+        },
+        "myDocs.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Optional API key. Sent as both x-api-key and Bearer auth so it is easy to adapt to a real provider."
+        },
+        "myDocs.defaultDocs": {
+          "type": "array",
+          "description": "Named documentation sources used by myDocs.searchInDocs and Docs Chat.",
+          "default": [
+            {
+              "name": "React Docs",
+              "baseUrl": "https://react.dev"
+            },
+            {
+              "name": "Next.js Docs",
+              "baseUrl": "https://nextjs.org/docs"
+            },
+            {
+              "name": "MDN Web Docs",
+              "baseUrl": "https://developer.mozilla.org"
+            },
+            {
+              "name": "SwiftUI Docs",
+              "baseUrl": "https://developer.apple.com/documentation/swiftui"
+            }
+          ],
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "baseUrl"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Human-friendly label shown in the UI."
+              },
+              "baseUrl": {
+                "type": "string",
+                "description": "Base URL or origin for the documentation set."
+              }
+            }
+          }
+        },
+        "myPreview.browserExecutablePath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional explicit path to Chrome, Chromium, or Edge used for the CDP-backed browser workbench."
+        },
+        "myPreview.allowLocalhost": {
+          "type": "boolean",
+          "default": true,
+          "description": "Allow localhost and loopback URLs in the browser workbench."
+        },
+        "myPreview.allowPrivateHosts": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow RFC1918/private-network hosts in the browser workbench."
+        },
+        "myPreview.allowedHosts": {
+          "type": "array",
+          "default": [],
+          "description": "Optional allowlist of hostnames. When set, only these hosts can be opened in the browser workbench.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "myPreview.viewportWidth": {
+          "type": "number",
+          "default": 1440,
+          "description": "Viewport width used by the headless browser for screenshots and hit testing."
+        },
+        "myPreview.viewportHeight": {
+          "type": "number",
+          "default": 900,
+          "description": "Viewport height used by the headless browser for screenshots and hit testing."
+        },
+        "myPreview.screenshotFormat": {
+          "type": "string",
+          "enum": [
+            "jpeg",
+            "png"
+          ],
+          "default": "jpeg",
+          "description": "Screenshot encoding for the workbench. JPEG is much faster and uses less memory than PNG at typical viewport sizes."
+        },
+        "myPreview.jpegQuality": {
+          "type": "number",
+          "default": 82,
+          "minimum": 40,
+          "maximum": 100,
+          "description": "JPEG quality (40–100) when screenshotFormat is jpeg. Lower values are faster and smaller."
+        },
+        "myPreview.maxOuterHtmlLength": {
+          "type": "number",
+          "default": 1200,
+          "description": "Maximum sanitized outerHTML length included in copied AI context."
+        },
+        "myPreview.enableBrowserBridge": {
+          "type": "boolean",
+          "default": true,
+          "description": "When true, starts a localhost HTTP bridge so MCP and other tools can control the browser (see browser-bridge.json in extension global storage)."
+        },
+        "myPreview.browserBridgePort": {
+          "type": "number",
+          "default": 0,
+          "description": "HTTP port for the browser bridge (0 = random free port). Set a fixed port if you reference it from MCP config."
+        },
+        "myPreview.browserBridgeToken": {
+          "type": "string",
+          "default": "",
+          "description": "Optional shared secret for the bridge (sent as X-Browser-Bridge-Token). Leave empty to auto-generate and persist in global state."
+        },
+        "myPreview.persistUserDataDir": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, uses a persistent browser profile directory to preserve cookies and localStorage across sessions. When false (default), uses temporary profiles to avoid Chrome singleton lock conflicts."
+        },
+        "myPreview.debugLogging": {
+          "type": "boolean",
+          "default": false,
+          "description": "Write Browser Workbench navigation, capture, and webview diagnostics to the My Preview output channel."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -w -p ./",
+    "validate": "tsc -p ./ --noEmit",
+    "test": "npm run compile && node --test tests/**/*.test.mjs",
+    "package": "vsce package --allow-missing-repository"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "pick-dom-element": "^0.2.3",
+    "ws": "^8.18.3",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "@types/vscode": "^1.90.0",
+    "@types/ws": "^8.18.1",
+    "@vscode/vsce": "^3.2.2",
+    "esbuild": "^0.28.0",
+    "typescript": "^5.8.3"
+  }
+}

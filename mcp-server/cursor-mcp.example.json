@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "inside-editor-browser": {
+      "command": "node",
+      "args": [
+        "/ABSOLUTE/PATH/TO/extension/mcp-server/browser-mcp.mjs"
+      ],
+      "env": {
+        "BROWSER_BRIDGE_CONFIG": "/ABSOLUTE/PATH/TO/browser-bridge.json"
+      }
+    }
+  }
+}
