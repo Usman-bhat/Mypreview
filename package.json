@@ -1,7 +1,7 @@
 {
-  "name": "inside-editor-preview-docs",
-  "displayName": "Inside Editor Browser + Docs",
-  "description": "CDP-backed browser workbench with element picking, AI context export, and provider-agnostic docs search.",
+  "name": "mypreview",
+  "displayName": "MyPreview",
+  "description": "Bring the modern, agentic IDE browser experience directly into VS Code with CDP-backed live preview and element picking.",
   "version": "0.1.0",
   "publisher": "local",
   "license": "MIT",
