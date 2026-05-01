@@ -1,0 +1,26 @@
+# Build dependencies
+node_modules/
+out/
+
+# VS Code extension packages
+*.vsix
+
+# OS files
+.DS_Store
+
+# Temporary / Scratch / Debug files
+antigravity/
+debug_screenshot.jpg
+screenshot_false.jpg
+scratch*.js
+build-picker.mjs
+get_colors.py
+get_dim.py
+index.html
+
+# User resources & guides
+Comprehensive_Guide__Replicating_Cursor_AI's_Built.docx
+
+# Experimental source folders
+files from cursor folder mac/
+files from manus/
