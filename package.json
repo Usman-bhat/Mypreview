@@ -3,7 +3,7 @@
   "displayName": "MyPreview",
   "description": "Bring the modern, agentic IDE browser experience directly into VS Code with CDP-backed live preview and element picking.",
   "version": "0.1.0",
-  "publisher": "local",
+  "publisher": "usman-bhat",
   "license": "MIT",
   "files": [
     "out/**",
