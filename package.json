@@ -4,6 +4,7 @@
   "description": "Bring the modern, agentic IDE browser experience directly into VS Code with CDP-backed live preview and element picking.",
   "version": "0.1.0",
   "publisher": "MohammadUsman",
+  "icon": "media/logo.png",
   "license": "MIT",
   "repository": {
     "type": "git",

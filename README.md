@@ -4,6 +4,12 @@ Bring the modern, agentic IDE browser experience directly into VS Code!
 
 This extension provides a fully featured, CDP-backed headless browser inside a VS Code webview panel, allowing you to instantly view your live apps, interact with them, and **extract precise DOM context for AI chat agents**. It perfectly bridges the gap between your editor, your browser, and your AI assistant.
 
+[![Visual Studio Marketplace](https://img.shields.io/badge/Download_from-VS_Code_Marketplace-blue?logo=visual-studio-code)](https://marketplace.visualstudio.com/items?itemName=MohammadUsman.mypreview)
+
+<p align="center">
+  <img src="media/logo.png" alt="MyPreview Logo" width="150" />
+</p>
+
 <p align="center">
   <img src="media/demo.gif" alt="Inside Editor Browser Demo" width="100%" />
 </p>
