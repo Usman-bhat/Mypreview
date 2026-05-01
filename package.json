@@ -5,6 +5,10 @@
   "version": "0.1.0",
   "publisher": "MohammadUsman",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Usman-bhat/Mypreview.git"
+  },
   "files": [
     "out/**",
     "media/**",
