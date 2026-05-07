@@ -32,6 +32,12 @@ export interface BrowserScreenshot {
   capturedAt: string;
 }
 
+export interface ElementScreenshot {
+  dataUrl: string;
+  width: number;
+  height: number;
+}
+
 export interface ElementInspectorData {
   nodeId: number;
   backendNodeId?: number;
@@ -57,6 +63,8 @@ export interface ElementReference {
   computedStylesHash: string;
   box: ElementBox;
   pinnedAt: string;
+  screenshot?: ElementScreenshot;
+  attributes?: Record<string, string>;
 }
 
 export interface BrowserNavigationState {

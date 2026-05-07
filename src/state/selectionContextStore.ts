@@ -2,6 +2,8 @@ import * as vscode from "vscode";
 
 import { ElementReference } from "../browser/types";
 
+const MAX_SELECTIONS = 6;
+
 export class SelectionContextStore {
   private readonly emitter = new vscode.EventEmitter<readonly ElementReference[]>();
   private selections: ElementReference[] = [];
@@ -15,6 +17,11 @@ export class SelectionContextStore {
   public setSelections(selections: readonly ElementReference[]): void {
     this.selections = [...selections];
     this.emitter.fire(this.selections);
+  }
+
+  public appendSelection(selection: ElementReference): void {
+    const withoutDuplicate = this.selections.filter((item) => item.id !== selection.id);
+    this.setSelections([...withoutDuplicate, selection].slice(-MAX_SELECTIONS));
   }
 
   public clear(): void {

@@ -33,6 +33,12 @@ export function serializeSelectionContext(references: ElementReference[]): strin
     computedStylesHash: reference.computedStylesHash,
     outerHtml: reference.outerHtml,
     selector: reference.selector,
+    screenshot: reference.screenshot
+      ? {
+          height: reference.screenshot.height,
+          width: reference.screenshot.width,
+        }
+      : undefined,
     tagName: reference.tagName,
     textSnippet: reference.textSnippet,
     url: reference.url,
@@ -48,6 +54,9 @@ export function serializeSelectionContext(references: ElementReference[]): strin
             `- Tag: \`${reference.tagName}\``,
             `- Box: ${reference.box.width}x${reference.box.height} at (${reference.box.x}, ${reference.box.y})`,
             `- Styles Hash: \`${reference.computedStylesHash}\``,
+            reference.screenshot
+              ? `- Screenshot: ${reference.screenshot.width}x${reference.screenshot.height} captured`
+              : undefined,
             reference.textSnippet ? `- Text: ${reference.textSnippet}` : undefined,
             "",
             "```html",

@@ -1,11 +1,10 @@
 import * as vscode from "vscode";
 
-import { ChatTurn, SerializedPreviewPanel } from "../types";
+import { SerializedPreviewPanel } from "../types";
 
 export class WorkspaceState {
   private static readonly lastPreviewUrlKey = "myPreview.lastUrl";
   private static readonly panelSnapshotsKey = "myPreview.panelSnapshots";
-  private static readonly chatHistoryKey = "myDocs.chatHistory";
 
   public constructor(private readonly context: vscode.ExtensionContext) {}
 
@@ -34,13 +33,5 @@ export class WorkspaceState {
     const snapshots = this.getPanelSnapshots();
     delete snapshots[panelId];
     await this.context.workspaceState.update(WorkspaceState.panelSnapshotsKey, snapshots);
-  }
-
-  public getChatHistory(): ChatTurn[] {
-    return this.context.workspaceState.get<ChatTurn[]>(WorkspaceState.chatHistoryKey, []);
-  }
-
-  public async setChatHistory(history: ChatTurn[]): Promise<void> {
-    await this.context.workspaceState.update(WorkspaceState.chatHistoryKey, history);
   }
 }

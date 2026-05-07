@@ -1,15 +1,25 @@
+import { mkdir, writeFile } from "node:fs/promises";
+import * as path from "node:path";
+
 import * as vscode from "vscode";
 
 import { BrowserSession } from "../browser/browserSession";
+import { serializeSelectionContext } from "../browser/contextExport";
+import { buildElementReference } from "../browser/inspectorModel";
+import { PickerController } from "../browser/pickerController";
 import { ensureBrowserProfileDirectory } from "../profile/browserProfilePath";
 import {
   BrowserNavigationState,
+  ElementBox,
   ElementReference,
+  ElementInspectorData,
+  ElementScreenshot,
   PreviewSecuritySettings,
 } from "../browser/types";
 import { WorkspaceState } from "../state/workspaceState";
 import { SelectionContextStore } from "../state/selectionContextStore";
 import { SerializedPreviewPanel } from "../types";
+import { writeImageToSystemClipboard } from "../utils/systemClipboard";
 import { hostnameLabel, validatePreviewUrl } from "../utils/url";
 
 interface BrowserWorkbenchMessage {
@@ -23,6 +33,28 @@ interface WebviewFrameDiagnostic {
   naturalWidth?: number;
   naturalHeight?: number;
   loadedAt?: string;
+}
+
+interface PickedElementPayload {
+  cancelled?: boolean;
+  clientX?: number;
+  clientY?: number;
+  outerHTML?: string;
+  selector?: string;
+  tag?: string;
+  textSnippet?: string;
+}
+
+interface CaptureScreenshotResponse {
+  data: string;
+}
+
+interface ScreenshotClip {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  scale: number;
 }
 
 export class LivePreviewManager implements vscode.Disposable {
@@ -124,11 +156,101 @@ export class LivePreviewManager implements vscode.Disposable {
   }
 
   public async copyContextForAi(): Promise<void> {
-    // No-op in iframe mode (no CDP element pinning)
+    const context = this.buildSelectionContextExport();
+    if (!context) {
+      void vscode.window.showInformationMessage("Pick an element before copying browser context for AI.");
+      return;
+    }
+
+    await vscode.env.clipboard.writeText(context);
+    vscode.window.setStatusBarMessage("$(copy) Browser selection context copied", 2500);
+  }
+
+  private elementIdCounter = 0;
+
+  public nextCursorElementId(): string {
+    this.elementIdCounter += 1;
+    return `cursor-el-${this.elementIdCounter}`;
+  }
+
+  public async sendSingleElementToIdeAgent(element: ElementReference): Promise<void> {
+    const cursorElementId = this.nextCursorElementId();
+
+    const prompt = formatElementDomForAgent(
+      {
+        tagName: element.tagName,
+        selector: element.selector,
+        outerHtml: element.outerHtml,
+        attributes: element.attributes,
+        box: element.box,
+        cursorElementId,
+      },
+      getAgentDomFormatConfig(),
+    );
+
+    await this.handoffPromptToIdeAgent(prompt, "Picked element");
+  }
+
+  public async sendScreenshotToIdeAgent(
+    dataUrl: string,
+    options: {
+      clip?: ScreenshotClip | null;
+      currentUrl?: string;
+      label: string;
+    },
+  ): Promise<void> {
+    const asset = await this.persistDataUrlAsset(dataUrl, "browser-capture");
+
+    if (asset) {
+      const placedOnClipboard = await writeImageToSystemClipboard(asset.filePath, asset.mime);
+      if (placedOnClipboard) {
+        await this.openChatPanelOnly();
+        await delay(520);
+        await this.tryPasteIntoChatInput();
+
+        // We can't reliably detect whether Cursor's composer actually
+        // received the paste (the command reports success even when focus
+        // wasn't on the chat input). Always tell the user the screenshot is
+        // on the clipboard so they can paste it themselves if needed.
+        const pasteShortcut = process.platform === "darwin" ? "⌘V" : "Ctrl+V";
+        vscode.window.setStatusBarMessage(
+          `$(device-camera) ${options.label} sent to agent — press ${pasteShortcut} if it didn't appear`,
+          5000,
+        );
+        void vscode.window.showInformationMessage(
+          `📸 Screenshot copied to clipboard. If it didn't appear in the agent textbox, click the chat input and press ${pasteShortcut}.`,
+        );
+        this.getLastActivePanel()?.sendCommand("browser.screenshotToast", {
+          label: options.label,
+          shortcut: pasteShortcut,
+        });
+        return;
+      }
+    }
+
+    // Fallback: clipboard image write failed (missing OS tool / unsupported platform).
+    // Send a text prompt with the file path so the agent can still see the screenshot.
+    const clipSummary = options.clip
+      ? `- Capture Box: ${Math.round(options.clip.width)}x${Math.round(options.clip.height)} at (${Math.round(options.clip.x)}, ${Math.round(options.clip.y)})`
+      : undefined;
+
+    const prompt = [
+      "Browser Workbench screenshot context for the IDE agent.",
+      "Use this capture as visual reference for the next UI change request.",
+      options.currentUrl ? `- Page URL: ${options.currentUrl}` : undefined,
+      `- Capture Type: ${options.label}`,
+      asset ? `- Screenshot File: ${asset.filePath}` : undefined,
+      clipSummary,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    await this.handoffPromptToIdeAgent(prompt, "Browser screenshot");
   }
 
   public async clearSelections(): Promise<void> {
     this.selectionContextStore.clear();
+    this.getLastActivePanel()?.sendCommand("browser.selectionContextChanged");
   }
 
   /**
@@ -179,6 +301,18 @@ export class LivePreviewManager implements vscode.Disposable {
     return this.selectionContextStore.getSelections();
   }
 
+  public get onDidChangeSelectionContext(): vscode.Event<readonly ElementReference[]> {
+    return this.selectionContextStore.onDidChange;
+  }
+
+  public appendSelection(reference: ElementReference): void {
+    this.selectionContextStore.appendSelection(reference);
+  }
+
+  public getSelectionContextExport(): string | undefined {
+    return this.buildSelectionContextExport();
+  }
+
   public trace(message: string, data?: unknown): void {
     const configuration = vscode.workspace.getConfiguration("myPreview");
     if (!configuration.get<boolean>("debugLogging", false)) {
@@ -196,6 +330,8 @@ export class LivePreviewManager implements vscode.Disposable {
     this.outputChannel.appendLine(`Active panel URL: ${active?.currentUrl ?? "<none>"}`);
     this.outputChannel.appendLine(`Panel visible: ${active ? String(active.visible) : "<none>"}`);
     this.outputChannel.appendLine(`Panel last frame: ${JSON.stringify(active?.lastFrameDiagnostic ?? null)}`);
+
+    await this.logChatCommandAvailability();
 
     if (!this.cdpSession) {
       this.outputChannel.appendLine("CDP session: <not created>");
@@ -229,6 +365,41 @@ export class LivePreviewManager implements vscode.Disposable {
       this.outputChannel.appendLine(`Screenshot: ${shot.width}x${shot.height}, dataUrlLength=${shot.dataUrl.length}, prefix=${shot.dataUrl.slice(0, 23)}`);
     } catch (error) {
       this.outputChannel.appendLine(`Screenshot error: ${formatError(error)}`);
+    }
+  }
+
+  private async logChatCommandAvailability(): Promise<void> {
+    try {
+      const all = await vscode.commands.getCommands(true);
+      const present = (list: readonly string[]) => list.filter((c) => all.includes(c));
+      const missing = (list: readonly string[]) => list.filter((c) => !all.includes(c));
+
+      this.outputChannel.appendLine("");
+      this.outputChannel.appendLine("Chat command discovery:");
+      this.outputChannel.appendLine(`  open: present = ${JSON.stringify(present(IDE_AGENT_OPEN_COMMANDS))}`);
+      this.outputChannel.appendLine(`  open: missing = ${JSON.stringify(missing(IDE_AGENT_OPEN_COMMANDS))}`);
+      this.outputChannel.appendLine(`  focus: present = ${JSON.stringify(present(IDE_AGENT_FOCUS_COMMANDS))}`);
+      this.outputChannel.appendLine(`  focus: missing = ${JSON.stringify(missing(IDE_AGENT_FOCUS_COMMANDS))}`);
+      this.outputChannel.appendLine(`  paste: present = ${JSON.stringify(present(IDE_AGENT_PASTE_COMMANDS))}`);
+      this.outputChannel.appendLine(`  paste: missing = ${JSON.stringify(missing(IDE_AGENT_PASTE_COMMANDS))}`);
+
+      const dynFocus = discoverComposerChatFocusCandidates(all);
+      const dynPaste = discoverComposerChatPasteCandidates(all);
+      this.outputChannel.appendLine(`  dynamic focus candidates (top 15): ${JSON.stringify(dynFocus.slice(0, 15))}`);
+      this.outputChannel.appendLine(`  dynamic paste candidates (top 15): ${JSON.stringify(dynPaste.slice(0, 15))}`);
+
+      const chatRelated = all.filter((c) =>
+        /chat|composer|aichat|conversation/i.test(c)
+      );
+      this.outputChannel.appendLine(`  total chat-ish commands found: ${chatRelated.length}`);
+      for (const c of chatRelated.slice(0, 80)) {
+        this.outputChannel.appendLine(`    - ${c}`);
+      }
+      if (chatRelated.length > 80) {
+        this.outputChannel.appendLine(`    ... and ${chatRelated.length - 80} more`);
+      }
+    } catch (error) {
+      this.outputChannel.appendLine(`Chat command discovery failed: ${formatError(error)}`);
     }
   }
 
@@ -321,15 +492,18 @@ export class LivePreviewManager implements vscode.Disposable {
       persistUserDataDir = true;
     }
 
+    const rawScale = configuration.get<number>("deviceScaleFactor", 2);
+    const deviceScaleFactor = Math.min(3, Math.max(1, isFinite(rawScale) ? rawScale : 2));
+
     const browserConfig = {
       executablePath: configuration.get<string>("browserExecutablePath", "").trim() || undefined,
       viewport: {
         width: configuration.get<number>("viewportWidth", 1440),
         height: configuration.get<number>("viewportHeight", 900),
-        deviceScaleFactor: 1,
+        deviceScaleFactor,
       },
       screenshotFormat: configuration.get<"jpeg" | "png">("screenshotFormat", "jpeg"),
-      jpegQuality: configuration.get<number>("jpegQuality", 82),
+      jpegQuality: configuration.get<number>("jpegQuality", 92),
       userDataDir,
       persistUserDataDir,
     };
@@ -401,6 +575,174 @@ export class LivePreviewManager implements vscode.Disposable {
       ? `Browser: ${hostnameLabel(activeUrl)}`
       : "Browser: idle";
   }
+
+  private buildSelectionContextExport(): string | undefined {
+    const selections = [...this.selectionContextStore.getSelections()];
+    if (selections.length === 0) {
+      return undefined;
+    }
+
+    return serializeSelectionContext(selections);
+  }
+
+  private async persistDataUrlAsset(dataUrl: string, prefix: string): Promise<PersistedAsset | undefined> {
+    const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+    if (!match) {
+      return undefined;
+    }
+
+    const [, mime, base64] = match;
+    const extension = mime === "image/jpeg" ? "jpg" : mime === "image/png" ? "png" : "bin";
+    const directory = path.join(this.context.globalStorageUri.fsPath, "agent-artifacts");
+    const filePath = path.join(
+      directory,
+      `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.${extension}`,
+    );
+
+    await mkdir(directory, { recursive: true });
+    await writeFile(filePath, Buffer.from(base64, "base64"));
+    return { filePath, mime };
+  }
+
+  public async handoffPromptToIdeAgent(prompt: string, label: string): Promise<void> {
+    // Use the EXACT same path that already works for screenshots: write to the
+    // system clipboard, surface the composer (which leaves its Monaco input
+    // focused), then run the editor paste command.
+    await vscode.env.clipboard.writeText(prompt);
+    this.trace("ideAgent.handoff.start", { label, promptLength: prompt.length });
+
+    await this.openChatPanelOnly();
+    await delay(520);
+
+    const pasted = await this.tryPasteIntoChatInput();
+    if (pasted) {
+      this.trace("ideAgent.handoff.pasted", { label });
+      vscode.window.setStatusBarMessage(`$(comment-discussion) ${label} pasted into agent`, 3000);
+      return;
+    }
+
+    // Final fallback: simulate keystrokes via the `type` command. This works
+    // when `editor.action.clipboardPasteAction` doesn't (e.g. composer input
+    // was focused but Cursor swallowed the paste).
+    const typed = await this.tryTypeIntoChatInput(prompt);
+    if (typed) {
+      this.trace("ideAgent.handoff.typed", { label });
+      vscode.window.setStatusBarMessage(`$(comment-discussion) ${label} typed into agent`, 3000);
+      return;
+    }
+
+    this.trace("ideAgent.handoff.failed", { label });
+    void vscode.window.showInformationMessage(
+      `${label} copied. Press Cmd/Ctrl+V in the chat input to paste it.`,
+    );
+  }
+
+  /**
+   * Opens / surfaces the **persistent** chat panel (the sidebar / dock view),
+   * NOT the floating "Quick Composer" overlay. The first call opens it; every
+   * subsequent call only focuses it, so we never accidentally toggle / close
+   * an already-open chat or replace its existing prompt content.
+   *
+   * Avoids `composer.startComposerPrompt*` because those open the floating
+   * Quick Composer (it dismisses when focus shifts, which the user perceives
+   * as a "toast" of their pasted DOM).
+   */
+  private chatPanelEverOpened = false;
+
+  private async openChatPanelOnly(): Promise<void> {
+    const allCommands = await vscode.commands.getCommands(true);
+
+    // Persistent panel openers: open the sidebar / dock chat view that stays open.
+    const persistentOpenCandidates = [
+      "workbench.action.chat.open",
+      "aichat.newchataction",
+    ];
+
+    // Persistent focus candidates: just bring the existing chat into focus.
+    const persistentFocusCandidates = [
+      "workbench.panel.chat.view.copilot.focus",
+      "workbench.action.chat.open",
+      "aichat.newchataction",
+    ];
+
+    const sequence = this.chatPanelEverOpened ? persistentFocusCandidates : persistentOpenCandidates;
+
+    for (const command of sequence) {
+      if (!allCommands.includes(command)) continue;
+      try {
+        await vscode.commands.executeCommand(command);
+        this.trace("ideAgent.openPanel.ok", { command, mode: this.chatPanelEverOpened ? "focus" : "open" });
+        this.chatPanelEverOpened = true;
+        return;
+      } catch (error) {
+        this.trace("ideAgent.openPanel.error", { command, error: formatError(error) });
+      }
+    }
+
+    // If neither persistent surface was available, the floating Quick Composer
+    // is the last resort — at least the user's DOM goes somewhere visible.
+    for (const command of ["composer.startComposerPrompt", "composer.startComposerPrompt2"]) {
+      if (!allCommands.includes(command)) continue;
+      try {
+        await vscode.commands.executeCommand(command);
+        this.trace("ideAgent.openPanel.fallback", { command });
+        this.chatPanelEverOpened = true;
+        return;
+      } catch (error) {
+        this.trace("ideAgent.openPanel.fallback.error", { command, error: formatError(error) });
+      }
+    }
+  }
+
+  /**
+   * Pastes the current clipboard into whatever input is focused. Cursor does
+   * not expose a chat-aware paste command in any build I've seen, so we rely
+   * on `editor.action.clipboardPasteAction` after `openChatPanelOnly()` has
+   * surfaced the composer (which leaves its Monaco-based input focused).
+   */
+  private async tryPasteIntoChatInput(): Promise<boolean> {
+    const allCommands = await vscode.commands.getCommands(true);
+
+    for (const command of IDE_AGENT_PASTE_COMMANDS) {
+      if (!allCommands.includes(command)) continue;
+      try {
+        await vscode.commands.executeCommand(command);
+        return true;
+      } catch (error) {
+        this.trace("ideAgent.paste.error", { command, error: formatError(error) });
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Last-resort fallback: simulate typing via VS Code's built-in `type`
+   * command. This routes characters into whatever Monaco editor currently
+   * has focus, including Cursor's composer input. We chunk the text to avoid
+   * starving the event loop on long DOM strings.
+   */
+  private async tryTypeIntoChatInput(text: string): Promise<boolean> {
+    if (!text) return false;
+    const allCommands = await vscode.commands.getCommands(true);
+    if (!allCommands.includes("type")) return false;
+
+    try {
+      const chunkSize = 200;
+      for (let i = 0; i < text.length; i += chunkSize) {
+        await vscode.commands.executeCommand("type", { text: text.slice(i, i + chunkSize) });
+      }
+      return true;
+    } catch (error) {
+      this.trace("ideAgent.type.error", { error: formatError(error) });
+      return false;
+    }
+  }
+}
+
+interface PersistedAsset {
+  filePath: string;
+  mime: string;
 }
 
 class LivePreviewPanelController implements vscode.Disposable {
@@ -543,8 +885,8 @@ class LivePreviewPanelController implements vscode.Disposable {
     await this.handleMessage({ type: "browser.navigate", payload: { url } });
   }
 
-  public sendCommand(type: string): void {
-    this.postToWebview(type);
+  public sendCommand(type: string, payload?: unknown): void {
+    this.postToWebview(type, payload);
   }
 
   private postToWebview(type: string, payload?: unknown): void {
@@ -676,11 +1018,8 @@ class LivePreviewPanelController implements vscode.Disposable {
       case "browser.togglePickMode": {
         const nowActive = Boolean(payload?.active);
         this.pickMode = nowActive;
-        if (nowActive) {
-          await this.injectPickerScript();
-        } else {
-          await this.removePickerScript();
-        }
+        // In the CDP streaming architecture, we don't inject the DOM picker script.
+        // We rely entirely on `DOM.getNodeForLocation` handling in mousemove/click.
         break;
       }
 
@@ -725,35 +1064,36 @@ class LivePreviewPanelController implements vscode.Disposable {
         break;
 
       case "browser.click":
-        // In pick mode, clicks are intercepted by the injected script inside the page.
-        // We only forward clicks to CDP when NOT in pick mode.
-        if (!this.pickMode && payload) {
+        if (payload) {
           try {
+            const x = Number(payload.x);
+            const y = Number(payload.y);
+
+            if (this.pickMode) {
+              await this.handleElementPicked({ clientX: x, clientY: y });
+              // Stay in pick mode so user can click multiple elements
+              break;
+            }
+
             const session = await this.getContextSession();
-            await session.clickPoint(Number(payload.x), Number(payload.y));
+            await session.clickPoint(x, y);
           } catch (e) { }
         }
         break;
 
       case "browser.elementPicked": {
-        // Message received from the injected picker script via CDP binding callback.
-        // Unsubscribe the listener regardless of outcome.
-        this.pickerUnsubscribe?.();
-        this.pickerUnsubscribe = undefined;
-
-        const cancelled = Boolean((payload as any)?.cancelled);
-        const html = typeof payload?.outerHTML === "string" ? payload.outerHTML : "";
-        const tag  = typeof payload?.tag     === "string" ? payload.tag     : "element";
-
-        if (!cancelled && html) {
-          await this.manager.insertAtEditorCursor(html);
-          vscode.window.setStatusBarMessage(`$(code) Picked <${tag}> — HTML inserted at cursor`, 3000);
+        const picked = payload as PickedElementPayload;
+        if (picked.cancelled) {
+          this.pickerUnsubscribe?.();
+          this.pickerUnsubscribe = undefined;
+          this.pickMode = false;
+          this.pickerInjected = false;
+          this.postToWebview("browser.togglePickMode", { active: false });
+          this.postToWebview("browser.inspectHover", null);
+        } else {
+          await this.handleElementPicked(picked);
+          // Stay in pick mode for multi-pick
         }
-        // Exit pick mode
-        this.pickMode = false;
-        this.pickerInjected = false;
-        this.postToWebview("browser.togglePickMode", { active: false });
-        this.postToWebview("browser.inspectHover", null);
         break;
       }
 
@@ -800,6 +1140,13 @@ class LivePreviewPanelController implements vscode.Disposable {
         break;
 
       case "cursor.bridge":
+        break;
+
+      case "browser.selectionsChanged":
+        if (Array.isArray((payload as { selections?: unknown[] }).selections)
+          && (payload as { selections?: unknown[] }).selections?.length === 0) {
+          await this.manager.clearSelections();
+        }
         break;
 
       case "browser.updateStyle":
@@ -858,6 +1205,10 @@ class LivePreviewPanelController implements vscode.Disposable {
           const shot = await session.captureScreenshot();
           if (shot?.dataUrl) {
             this.postToWebview("browser.areaScreenshot", { dataUrl: shot.dataUrl, clip: null });
+            await this.manager.sendScreenshotToIdeAgent(shot.dataUrl, {
+              currentUrl: this.currentUrl,
+              label: "Full Page Screenshot",
+            });
           }
         } catch (e) {
           console.error('[LivePreview] Take screenshot failed:', e);
@@ -875,7 +1226,7 @@ class LivePreviewPanelController implements vscode.Disposable {
         try {
           // Capture specific area by element selector or bounding box
           const session = await this.getContextSession();
-          let clip: { x: number; y: number; width: number; height: number; scale: number } | undefined;
+          let clip: ScreenshotClip | undefined;
 
           if (payload?.selector) {
             // Get bounding box of specified element
@@ -903,6 +1254,11 @@ class LivePreviewPanelController implements vscode.Disposable {
           if (resp?.data) {
             const dataUrl = `data:image/png;base64,${resp.data}`;
             this.postToWebview("browser.areaScreenshot", { dataUrl, clip });
+            await this.manager.sendScreenshotToIdeAgent(dataUrl, {
+              clip: clip ?? null,
+              currentUrl: this.currentUrl,
+              label: payload?.selector ? "Element Screenshot" : "Area Screenshot",
+            });
           }
         } catch (e) {
           console.error('[LivePreview] Area capture failed:', e);
@@ -912,6 +1268,305 @@ class LivePreviewPanelController implements vscode.Disposable {
       default:
         break;
     }
+  }
+
+  private async handleElementPicked(payload: PickedElementPayload): Promise<void> {
+    const tag = typeof payload.tag === "string" && payload.tag ? payload.tag : "element";
+    const html = typeof payload.outerHTML === "string" ? payload.outerHTML : "";
+
+    const selection = await this.resolvePickedSelection(payload);
+    if (selection) {
+      this.manager.appendSelection(selection);
+      this.postToWebview("browser.selectionContextChanged", {
+        selections: this.manager.getSelectionContext(),
+      });
+      this.postToWebview("browser.elementSelected", selection);
+      // The handoff itself sets a more accurate status bar message
+      // (e.g. "pasted into agent" / "typed into agent" / fall-back info).
+      const prompt = await this.buildPickedElementAgentPrompt(selection, payload);
+      await this.manager.handoffPromptToIdeAgent(prompt, "Picked element");
+      return;
+    }
+
+    // Fallback A: webview supplied outerHTML (only in non-streaming mode).
+    if (html) {
+      const fallbackPrompt = formatElementDomForAgent(
+        {
+          tagName: tag,
+          outerHtml: html,
+          cursorElementId: this.manager.nextCursorElementId(),
+        },
+        getAgentDomFormatConfig(),
+      );
+      await this.manager.handoffPromptToIdeAgent(fallbackPrompt, "Picked element");
+      return;
+    }
+
+    // Fallback B: lightweight CDP probe — even when the full picker chain
+    // fails (e.g. CSS.getComputedStyleForNode throws), this almost always
+    // succeeds because it only needs Runtime.evaluate.
+    const probed = await this.probeElementHtmlAt(payload);
+    if (probed) {
+      const fallbackPrompt = formatElementDomForAgent(
+        {
+          tagName: probed.tagName,
+          selector: probed.selector,
+          outerHtml: probed.outerHtml,
+          cursorElementId: this.manager.nextCursorElementId(),
+        },
+        getAgentDomFormatConfig(),
+      );
+      await this.manager.handoffPromptToIdeAgent(fallbackPrompt, "Picked element");
+      return;
+    }
+
+    vscode.window.setStatusBarMessage(
+      `$(warning) Pick failed for <${tag}> — see "My Preview" output`,
+      3500,
+    );
+  }
+
+  private async buildPickedElementAgentPrompt(
+    selection: ElementReference,
+    payload: PickedElementPayload,
+  ): Promise<string> {
+    const cfg = getAgentDomFormatConfig();
+    const cursorElementId = this.manager.nextCursorElementId();
+
+    const promoted =
+      cfg.promoteSvgPicksToRoot &&
+      typeof payload.clientX === "number" &&
+      typeof payload.clientY === "number"
+        ? await this.tryPromoteSvgInnerPickToOwningSvg(payload.clientX, payload.clientY, selection.tagName)
+        : undefined;
+
+    if (promoted) {
+      return formatElementDomForAgent(
+        {
+          tagName: promoted.tagName,
+          selector: promoted.selector,
+          outerHtml: promoted.outerHtml,
+          box: promoted.box,
+          cursorElementId,
+        },
+        cfg,
+      );
+    }
+
+    return formatElementDomForAgent(
+      {
+        tagName: selection.tagName,
+        selector: selection.selector,
+        outerHtml: selection.outerHtml,
+        attributes: selection.attributes,
+        box: selection.box,
+        cursorElementId,
+      },
+      cfg,
+    );
+  }
+
+  private async tryPromoteSvgInnerPickToOwningSvg(
+    clientX: number,
+    clientY: number,
+    pickedTagName: string,
+  ): Promise<{ tagName: string; selector: string; outerHtml: string; box: ElementBox } | undefined> {
+    const tag = pickedTagName.toLowerCase();
+    if (tag === "svg" || !SVG_INNER_TAGS_FOR_PROMOTION.has(tag)) {
+      return undefined;
+    }
+    try {
+      const session = await this.getContextSession();
+      const max = this.getMaxOuterHtmlLength();
+      const expr = `(() => {
+        const el = document.elementFromPoint(${Math.round(clientX)}, ${Math.round(clientY)});
+        if (!el || typeof el.closest !== "function") return null;
+        const svg = el.closest("svg");
+        if (!svg || el === svg) return null;
+        function buildSelector(node) {
+          const parts = [];
+          let cur = node;
+          while (cur && cur.nodeType === 1) {
+            let part = cur.localName || (cur.tagName || "").toLowerCase();
+            if (!part) break;
+            if (cur.id) {
+              part += "#" + CSS.escape(cur.id);
+              parts.unshift(part);
+              break;
+            }
+            const cls = Array.from(cur.classList || []).slice(0, 2);
+            if (cls.length) part += cls.map((c) => "." + CSS.escape(c)).join("");
+            parts.unshift(part);
+            cur = cur.parentElement;
+          }
+          return parts.join(" > ");
+        }
+        const r = svg.getBoundingClientRect();
+        return {
+          tagName: "svg",
+          selector: buildSelector(svg),
+          outerHtml: (svg.outerHTML || "").slice(0, ${max}),
+          box: {
+            x: r.left,
+            y: r.top,
+            width: r.width,
+            height: r.height,
+            top: r.top,
+            left: r.left,
+            right: r.right,
+            bottom: r.bottom,
+          },
+        };
+      })()`;
+      type Promoted = { tagName: string; selector: string; outerHtml: string; box: ElementBox };
+      const resp = await session.send<{ result?: { value?: Promoted | null } }>("Runtime.evaluate", {
+        expression: expr,
+        returnByValue: true,
+      });
+      const value = resp?.result?.value;
+      if (!value || !value.outerHtml || value.tagName !== "svg") {
+        return undefined;
+      }
+      this.trace("picker.svgPromote.ok", { fromTag: tag, selector: value.selector });
+      return value;
+    } catch (error) {
+      this.trace("picker.svgPromote.error", { error: formatError(error) });
+      return undefined;
+    }
+  }
+
+  private async probeElementHtmlAt(payload: PickedElementPayload): Promise<{
+    tagName: string;
+    selector: string;
+    outerHtml: string;
+    text: string;
+  } | undefined> {
+    if (typeof payload.clientX !== "number" || typeof payload.clientY !== "number") {
+      return undefined;
+    }
+    try {
+      const session = await this.getContextSession();
+      const max = this.getMaxOuterHtmlLength();
+      const expr = `(() => {
+        const el = document.elementFromPoint(${Math.round(payload.clientX)}, ${Math.round(payload.clientY)});
+        if (!el) return null;
+        function buildSelector(node) {
+          const parts = [];
+          let cur = node;
+          while (cur && cur.nodeType === 1) {
+            let part = cur.localName || (cur.tagName || '').toLowerCase();
+            if (!part) break;
+            if (cur.id) { part += '#' + CSS.escape(cur.id); parts.unshift(part); break; }
+            const cls = Array.from(cur.classList || []).slice(0, 2);
+            if (cls.length) part += cls.map(c => '.' + CSS.escape(c)).join('');
+            parts.unshift(part);
+            cur = cur.parentElement;
+          }
+          return parts.join(' > ');
+        }
+        return {
+          tagName: (el.tagName || '').toLowerCase(),
+          selector: buildSelector(el),
+          outerHtml: (el.outerHTML || '').slice(0, ${max * 2}),
+          text: (el.innerText || el.textContent || '').trim().slice(0, 400),
+        };
+      })()`;
+      const resp = await session.send<{ result?: { value?: { tagName: string; selector: string; outerHtml: string; text: string } | null } }>(
+        "Runtime.evaluate",
+        { expression: expr, returnByValue: true },
+      );
+      const value = resp?.result?.value;
+      this.trace("picker.probe.result", { hasValue: Boolean(value) });
+      if (!value || !value.outerHtml) return undefined;
+      return value;
+    } catch (error) {
+      this.trace("picker.probe.error", { error: formatError(error) });
+      return undefined;
+    }
+  }
+
+  private async resolvePickedSelection(payload: PickedElementPayload): Promise<ElementReference | undefined> {
+    if (typeof payload.clientX !== "number" || typeof payload.clientY !== "number" || !this.currentUrl) {
+      return undefined;
+    }
+
+    try {
+      const session = await this.getContextSession();
+      const picker = new PickerController(session, this.getMaxOuterHtmlLength(), this.trace);
+      const inspector = await picker.inspectPoint(Math.round(payload.clientX), Math.round(payload.clientY), this.currentUrl);
+
+      if (!inspector) {
+        this.trace("picker.resolve.inspectorMissing", { x: payload.clientX, y: payload.clientY });
+        return undefined;
+      }
+
+      const screenshot = await this.captureElementScreenshot(session, inspector);
+      const reference = buildElementReference(inspector);
+      if (screenshot) {
+        reference.screenshot = screenshot;
+      }
+
+      return reference;
+    } catch (error) {
+      this.trace("picker.resolve.error", { payload, error: formatError(error) });
+      return undefined;
+    }
+  }
+
+  private async captureElementScreenshot(
+    session: BrowserSession,
+    inspector: ElementInspectorData,
+  ): Promise<ElementScreenshot | undefined> {
+    if (inspector.box.width < 2 || inspector.box.height < 2) {
+      return undefined;
+    }
+
+    const configuration = vscode.workspace.getConfiguration("myPreview");
+    const viewportWidth = configuration.get<number>("viewportWidth", 1440);
+    const viewportHeight = configuration.get<number>("viewportHeight", 900);
+    const padding = 8;
+
+    const x = clamp(Math.floor(inspector.box.x - padding), 0, Math.max(0, viewportWidth - 1));
+    const y = clamp(Math.floor(inspector.box.y - padding), 0, Math.max(0, viewportHeight - 1));
+    const width = clamp(
+      Math.ceil(inspector.box.width + padding * 2),
+      1,
+      Math.max(1, viewportWidth - x),
+    );
+    const height = clamp(
+      Math.ceil(inspector.box.height + padding * 2),
+      1,
+      Math.max(1, viewportHeight - y),
+    );
+
+    try {
+      await session.send("Page.bringToFront").catch(() => undefined);
+      const response = await session.send<CaptureScreenshotResponse>("Page.captureScreenshot", {
+        captureBeyondViewport: false,
+        clip: { x, y, width, height, scale: 1 },
+        format: "png",
+      });
+
+      if (!response?.data) {
+        return undefined;
+      }
+
+      return {
+        dataUrl: `data:image/png;base64,${response.data}`,
+        width,
+        height,
+      };
+    } catch (error) {
+      this.trace("picker.captureElementScreenshot.error", {
+        selector: inspector.selector,
+        error: formatError(error),
+      });
+      return undefined;
+    }
+  }
+
+  private getMaxOuterHtmlLength(): number {
+    return vscode.workspace.getConfiguration("myPreview").get<number>("maxOuterHtmlLength", 1200);
   }
 
   // ── Manus-style element picker ────────────────────────────────────────────
@@ -941,15 +1596,8 @@ class LivePreviewPanelController implements vscode.Disposable {
         const event = params as { name?: string; payload?: string };
         if (event.name !== "__vscodePicker") return;
         try {
-          const data = JSON.parse(event.payload ?? "{}") as {
-            outerHTML: string;
-            tag: string;
-            id: string;
-            classes: string[];
-            selector: string;
-            cancelled?: boolean;
-          };
-          void this.handleMessage({ type: "browser.elementPicked", payload: data as any });
+          const data = JSON.parse(event.payload ?? "{}") as PickedElementPayload;
+          void this.handleMessage({ type: "browser.elementPicked", payload: data as Record<string, unknown> });
         } catch { /* malformed payload */ }
       });
 
@@ -1083,12 +1731,25 @@ class LivePreviewPanelController implements vscode.Disposable {
               <rect x="4" y="4" width="8" height="8" rx="0.5" stroke="currentColor" stroke-width="1" stroke-dasharray="2 1.5" fill="none"/>
             </svg>
           </button>
+          <button id="cssInspectorButton" title="Inspect Selected Element (CSS)" class="icon-btn" aria-label="CSS Inspector">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M2 2h6v6H2z" stroke="currentColor" stroke-width="1.2" fill="none"/>
+              <path d="M9 9h5v5H9z" stroke="currentColor" stroke-width="1.2" fill="none"/>
+              <path d="M5 5l8 8" stroke="currentColor" stroke-width="1" stroke-dasharray="1.5 1.5"/>
+            </svg>
+          </button>
+          <button id="componentsButton" title="Toggle Components Tree" class="icon-btn" aria-label="Components Tree">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <rect x="1.5" y="1.5" width="6" height="13" rx="1" stroke="currentColor" stroke-width="1.2" fill="none"/>
+              <path d="M9.5 4h5M9.5 8h5M9.5 12h5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+            </svg>
+          </button>
           <div class="separator"></div>
           <div style="position:relative">
             <button id="moreButton" type="button" class="icon-btn" title="More Actions\u2026" aria-label="More Actions"><svg width="16" height="16" viewBox="0 0 16 16"><circle fill="currentColor" cx="3.5" cy="8" r="1.5"/><circle fill="currentColor" cx="8" cy="8" r="1.5"/><circle fill="currentColor" cx="12.5" cy="8" r="1.5"/></svg></button>
             <div id="moreMenu" class="dropdown-menu hidden">
               <button id="menuToggleDevTools" class="dropdown-item">Developer Tools</button>
-              <button id="menuToggleCssInspector" class="dropdown-item">CSS Inspector</button>
+              <button id="menuToggleCssInspector" class="dropdown-item">Inspect Selected Element</button>
               <button id="menuToggleSidebar" class="dropdown-item">Toggle Sidebar</button>
               <button id="menuToggleTerminal" class="dropdown-item">Toggle Terminal</button>
               <div class="dropdown-divider"></div>
@@ -1120,6 +1781,16 @@ class LivePreviewPanelController implements vscode.Disposable {
         </div>
         <div id="selectionsList" class="selections-list"></div>
       </div>
+      <div class="workspace">
+        <aside id="componentsPanel" class="components-panel hidden" aria-label="Components">
+          <div class="components-header">
+            <span class="components-title">Components</span>
+            <button id="componentsClose" class="components-close" title="Hide panel">&times;</button>
+          </div>
+          <div id="componentsTree" class="components-tree">
+            <div class="components-empty">Pick elements to see them here as a tree.</div>
+          </div>
+        </aside>
       <div id="stage" class="stage">
         <div id="emptyState" class="empty-state hidden">Enter a URL to start browsing.</div>
         <img
@@ -1128,16 +1799,6 @@ class LivePreviewPanelController implements vscode.Disposable {
         />
         <div id="inspectHoverBox" class="inspect-hover-box hidden"></div>
         <div id="inspectTooltip" class="inspect-tooltip hidden"></div>
-        
-        <!-- Cursor-style Element Selector -->
-        <div id="elementSelector" class="element-selector hidden">
-          <div class="element-selector-info" id="elementSelectorInfo">No element selected</div>
-          <div class="element-selector-actions">
-            <button id="elementSelectBtn" class="element-selector-btn">Select</button>
-            <button id="elementInspectBtn" class="element-selector-btn">Inspect</button>
-            <button id="elementCopyBtn" class="element-selector-btn">Copy</button>
-          </div>
-        </div>
         
         <!-- Cursor-style CSS Inspector -->
         <div id="cssInspector" class="css-inspector">
@@ -1181,6 +1842,7 @@ class LivePreviewPanelController implements vscode.Disposable {
           <button class="context-menu-item" id="ctxScreenshot">Screenshot Element</button>
         </div>
       </div>
+      </div>
     </div>
     <script nonce="${nonce}" src="${scriptUri}"></script>
   </body>
@@ -1221,6 +1883,109 @@ function isBlankPageTitle(title: string): boolean {
   return title.trim().toLowerCase() === "about:blank";
 }
 
+/**
+ * Cursor builds often omit stable `aichat.focusInput`-style IDs. We mine the live
+ * command registry for composer/chat-scoped commands that look like they move
+ * focus into the prompt/input surface.
+ */
+function discoverComposerChatFocusCandidates(allCommands: readonly string[]): string[] {
+  const scored: { id: string; score: number }[] = [];
+  for (const id of allCommands) {
+    if (!isComposerChatScopedCommand(id)) continue;
+    if (isComposerChatNoiseCommand(id)) continue;
+    let score = scoreFocusCandidate(id);
+    if (/\bfocus\b/i.test(id)) score = Math.max(score, 58);
+    if (/\.focus$/i.test(id)) score = Math.max(score, 62);
+    if (/\b(activate|reveal)\w*View\b/i.test(id)) score += 28;
+    if (score < 20) continue;
+    scored.push({ id, score });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return [...new Set(scored.map((s) => s.id))];
+}
+
+function discoverComposerChatPasteCandidates(allCommands: readonly string[]): string[] {
+  const scored: { id: string; score: number }[] = [];
+  for (const id of allCommands) {
+    if (!isComposerChatScopedCommand(id)) continue;
+    if (isComposerChatNoiseCommand(id)) continue;
+    const lower = id.toLowerCase();
+    if (!/\bpaste\b|clipboard/.test(lower)) continue;
+    let score = 20;
+    if (/\bpaste\b/.test(lower)) score += 60;
+    if (/input|composer|aichat|prompt|widget/.test(lower)) score += 25;
+    scored.push({ id, score });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return [...new Set(scored.map((s) => s.id))];
+}
+
+function isComposerChatScopedCommand(id: string): boolean {
+  return (
+    /^composer\./i.test(id) ||
+    /^aichat\./i.test(id) ||
+    /^workbench\.action\.chat\./i.test(id) ||
+    /panel\.chat/i.test(id)
+  );
+}
+
+function isComposerChatNoiseCommand(id: string): boolean {
+  return /backgroundcomposer|inlinechat|chatediting|inlineResourceAnchor|gotoDefinition|addFile|addSymbol|addfile|addsymbol|selectPrevious|selectNext|SubComposerTab|togglePeek|openFile|openfile|diff|peek|testNotification|testOpen|copyLink|addToChat|resetTrusted|removeFile|accept|discard|workingSet|canvas\.|conversationPicker|openCloud|openDevTools|archive|openMachine|forwardedPort|repositoryMismatch|getBackground|getCurrentWorkspace|showBackground|openBackground|createPR|checkoutLocally|applyChanges|revertFile|copyRequestId|toggleControl|createNewComposer|restartSetup|startSetup|checkOut|deletedFile/i.test(
+    id,
+  );
+}
+
+function scoreFocusCandidate(id: string): number {
+  const lower = id.toLowerCase();
+  let score = 0;
+  if (/\bfocus\b/.test(lower)) score += 85;
+  if (/input|prompt|widget|textarea|primary|mainEditor|typeDispatch/.test(lower)) score += 35;
+  if (/^composer\./.test(lower)) score += 18;
+  if (/^aichat\./.test(lower)) score += 15;
+  if (/^workbench\.action\.chat\./.test(lower)) score += 12;
+  // Openers / tab switches — not helpful for "focus prompt before paste"
+  if (/\b(open|start|new|show|create|add|select|cancel|archive)\b/.test(lower) && !/\bfocus\b/.test(lower)) {
+    score -= 40;
+  }
+  if (/startcomposerprompt|newchataction|newfollowup/.test(lower)) score -= 70;
+  return score;
+}
+
+const IDE_AGENT_OPEN_COMMANDS = [
+  // Cursor / Composer
+  "composer.startComposerPrompt",
+  "composer.startComposerPrompt2",
+  "aichat.newchataction",
+  "aichat.newchatactioneditor",
+  "_workbench.action.composerNewSession",
+  // VS Code core / Copilot Chat
+  "workbench.action.chat.open",
+  "workbench.action.chat.openInSidebar",
+  "workbench.panel.chat.view.copilot.focus",
+  "workbench.action.chat.newChat",
+  // Antigravity
+  "conversationPicker.showConversationPicker",
+  "antigravity.openConversationPicker",
+] as const;
+
+const IDE_AGENT_FOCUS_COMMANDS = [
+  // Cursor
+  "aichat.focusInput",
+  "composer.focusInput",
+  "_aichat.focusInput",
+  // VS Code core / Copilot Chat
+  "workbench.action.chat.focusInput",
+  "chat.action.focus",
+] as const;
+
+const IDE_AGENT_PASTE_COMMANDS = [
+  // Cursor chat / composer paste handlers (if exposed)
+  "aichat.input.paste",
+  "composer.input.paste",
+  // Generic paste — works in any focused Monaco-based editor (chat input is one)
+  "editor.action.clipboardPasteAction",
+] as const;
+
 function formatDiagnosticLine(message: string, data?: unknown): string {
   const suffix = data === undefined ? "" : ` ${safeJson(data)}`;
   return `[${new Date().toISOString()}] ${message}${suffix}`;
@@ -1238,13 +2003,146 @@ function formatError(error: unknown): string {
   return error instanceof Error ? `${error.message}\n${error.stack ?? ""}`.trim() : String(error);
 }
 
-async function safeExecuteCommand(...commandIds: string[]): Promise<void> {
-  for (const id of commandIds) {
-    try {
-      await vscode.commands.executeCommand(id);
-      return;
-    } catch {
-      // command not available in this IDE, try next
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+/** SVG sub-elements: promoting picks to the owning `<svg>` avoids multi-KB `path d="..."` pastes. */
+const SVG_INNER_TAGS_FOR_PROMOTION = new Set([
+  "path",
+  "circle",
+  "rect",
+  "ellipse",
+  "line",
+  "polyline",
+  "polygon",
+  "g",
+  "text",
+  "tspan",
+  "textpath",
+  "use",
+  "defs",
+  "clippath",
+  "mask",
+  "pattern",
+  "lineargradient",
+  "radialgradient",
+  "stop",
+  "image",
+  "foreignobject",
+  "marker",
+  "view",
+  "desc",
+  "title",
+  "metadata",
+  "switch",
+  "symbol",
+  "animate",
+  "animatetransform",
+  "animatemotion",
+  "set",
+  "filter",
+]);
+
+interface AgentDomFormatConfig {
+  maxAttributeValueLength: number;
+  promoteSvgPicksToRoot: boolean;
+}
+
+function getAgentDomFormatConfig(): AgentDomFormatConfig {
+  const c = vscode.workspace.getConfiguration("myPreview");
+  const maxAttributeValueLength = c.get<number>("maxAgentAttributeLength", 120);
+  return {
+    maxAttributeValueLength: Math.min(2000, Math.max(32, maxAttributeValueLength)),
+    promoteSvgPicksToRoot: c.get<boolean>("promoteSvgPicksToRoot", true),
+  };
+}
+
+function truncateAttributeValueForAgent(name: string, value: string, max: number): string {
+  if (max < 8 || value.length <= max) {
+    const n = name.toLowerCase();
+    const alwaysCap =
+      n === "d" ||
+      n === "style" ||
+      n === "srcset" ||
+      n === "points" ||
+      (n === "src" && value.startsWith("data:"));
+    if (!alwaysCap || value.length <= max) {
+      return value;
     }
   }
+  const sliceLen = Math.max(1, max - 1);
+  return `${value.slice(0, sliceLen)}…`;
+}
+
+interface FormatElementDomOptions {
+  tagName: string;
+  outerHtml: string;
+  cursorElementId: string;
+  selector?: string;
+  attributes?: Record<string, string>;
+  box?: { top: number; left: number; width: number; height: number };
+}
+
+/**
+ * Renders a picked element as 3 compact lines for direct paste into the
+ * agent's chat input:
+ *
+ *   DOM Path: div.foo > div#bar > svg
+ *   Position: top=60px, left=290px, width=272px, height=92px
+ *   HTML Element: <svg ... data-cursor-element-id="cursor-el-1"></svg>
+ *
+ * The element's children are stripped — only the opening tag with its
+ * attributes survives (plus a stable `data-cursor-element-id` so the agent
+ * can reference each pick by id when several are sent).
+ */
+function formatElementDomForAgent(options: FormatElementDomOptions, format: AgentDomFormatConfig): string {
+  const lines: string[] = [];
+  if (options.selector) {
+    lines.push(`DOM Path: ${options.selector}`);
+  }
+  if (options.box) {
+    lines.push(
+      `Position: top=${Math.round(options.box.top)}px, left=${Math.round(options.box.left)}px, width=${Math.round(options.box.width)}px, height=${Math.round(options.box.height)}px`,
+    );
+  }
+  lines.push(`HTML Element: ${buildBareElementHtml(options, format)}`);
+  return lines.join("\n");
+}
+
+function buildBareElementHtml(options: FormatElementDomOptions, format: AgentDomFormatConfig): string {
+  const tag = options.tagName.toLowerCase() || "div";
+  const attrs: Record<string, string> = options.attributes
+    ? { ...options.attributes }
+    : extractAttributesFromOuterHtml(options.outerHtml);
+  attrs["data-cursor-element-id"] = options.cursorElementId;
+  const attrString = Object.entries(attrs)
+    .map(
+      ([name, value]) =>
+        `${name}="${escapeHtmlAttribute(truncateAttributeValueForAgent(name, value, format.maxAttributeValueLength))}"`,
+    )
+    .join(" ");
+  return `<${tag}${attrString ? " " + attrString : ""}></${tag}>`;
+}
+
+function extractAttributesFromOuterHtml(outerHtml: string): Record<string, string> {
+  const match = outerHtml.match(/^<\s*[a-zA-Z][^\s>/]*\s*([^>]*?)\s*\/?>/);
+  if (!match) return {};
+  const result: Record<string, string> = {};
+  const attrRegex = /([a-zA-Z_:][\w:.-]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/g;
+  let m: RegExpExecArray | null;
+  while ((m = attrRegex.exec(match[1])) !== null) {
+    const name = m[1];
+    const value = m[2] ?? m[3] ?? m[4] ?? "";
+    result[name] = value;
+  }
+  return result;
+}
+
+function escapeHtmlAttribute(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }

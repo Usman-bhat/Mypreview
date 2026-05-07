@@ -55,19 +55,39 @@ export class PickerController {
   public constructor(
     private readonly session: BrowserSession,
     private readonly maxOuterHtmlLength: number,
+    private readonly trace?: (message: string, data?: unknown) => void,
   ) {}
 
   public async inspectPoint(x: number, y: number, currentUrl: string): Promise<ElementInspectorData | undefined> {
     try {
+      // Make sure the DOM agent has populated its node id table — without
+      // this, `DOM.getNodeForLocation` can return nodeId: 0 on the first
+      // call after a navigation.
+      await this.session.send("DOM.getDocument", { depth: 0 }).catch(() => undefined);
+
       const located = await this.session.send<NodeForLocationResponse>("DOM.getNodeForLocation", {
         x,
         y,
         includeUserAgentShadowDOM: true,
         ignorePointerEventsNone: true,
       });
+      this.trace?.("picker.getNodeForLocation.ok", { x, y, located });
 
-      return this.inspectNode(located.nodeId, currentUrl, located.backendNodeId);
-    } catch {
+      let nodeId = located.nodeId;
+      if (!nodeId && located.backendNodeId) {
+        const desc = await this.session.send<DescribeNodeResponse>("DOM.describeNode", { backendNodeId: located.backendNodeId, depth: 0 });
+        nodeId = desc.node.nodeId;
+        this.trace?.("picker.describeFromBackendNodeId.ok", { backendNodeId: located.backendNodeId, nodeId });
+      }
+
+      if (!nodeId) {
+        this.trace?.("picker.noNodeAtLocation", { x, y, located });
+        return undefined;
+      }
+
+      return this.inspectNode(nodeId, currentUrl, located.backendNodeId);
+    } catch (error) {
+      this.trace?.("picker.inspectPoint.error", { x, y, error: formatPickerError(error) });
       return undefined;
     }
   }
@@ -78,11 +98,27 @@ export class PickerController {
     backendNodeId?: number,
   ): Promise<ElementInspectorData | undefined> {
     try {
-      const [describedNode, resolvedNode, computedStyles, boxModel] = await Promise.all([
-        this.session.send<DescribeNodeResponse>("DOM.describeNode", { nodeId, depth: 0 }),
-        this.session.send<ResolveNodeResponse>("DOM.resolveNode", { nodeId }),
-        this.session.send<ComputedStyleResponse>("CSS.getComputedStyleForNode", { nodeId }),
-        this.session.send<BoxModelResponse>("DOM.getBoxModel", { nodeId }),
+      // Required: describe + resolve. If either fails, the node is gone.
+      const describedNode = await this.session.send<DescribeNodeResponse>("DOM.describeNode", { nodeId, depth: 0 });
+      const resolvedNode = await this.session.send<ResolveNodeResponse>("DOM.resolveNode", { nodeId });
+
+      // Optional: computed styles and box model. Off-screen / 0-sized
+      // elements throw on getBoxModel; elements without computed styles
+      // (e.g. SVG fragments) throw on getComputedStyleForNode. Don't let
+      // those side issues abort the whole pick.
+      const [computedStyles, boxModel] = await Promise.all([
+        this.session
+          .send<ComputedStyleResponse>("CSS.getComputedStyleForNode", { nodeId })
+          .catch((error) => {
+            this.trace?.("picker.computedStyle.error", { nodeId, error: formatPickerError(error) });
+            return undefined;
+          }),
+        this.session
+          .send<BoxModelResponse>("DOM.getBoxModel", { nodeId })
+          .catch((error) => {
+            this.trace?.("picker.boxModel.error", { nodeId, error: formatPickerError(error) });
+            return undefined;
+          }),
       ]);
 
       const runtimePayload = await this.session.send<RuntimeValueResponse>("Runtime.callFunctionOn", {
@@ -148,15 +184,21 @@ export class PickerController {
 
       const runtimeValue = runtimePayload.result?.value as RuntimeInspectorValue | undefined;
       if (!runtimeValue) {
+        this.trace?.("picker.runtimeCallReturnedNoValue", { nodeId });
         return undefined;
       }
 
-      const computedStyleMap = computedStyles.computedStyle.reduce<Record<string, string>>((accumulator, style) => {
-        accumulator[style.name] = style.value;
-        return accumulator;
-      }, {});
+      const computedStyleMap = (computedStyles?.computedStyle ?? []).reduce<Record<string, string>>(
+        (accumulator, style) => {
+          accumulator[style.name] = style.value;
+          return accumulator;
+        },
+        {},
+      );
 
-      const box = boxFromModel(boxModel.model.border);
+      const box = boxModel
+        ? boxFromModel(boxModel.model.border)
+        : { x: 0, y: 0, width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0 };
 
       return buildInspectorData(
         {
@@ -173,10 +215,15 @@ export class PickerController {
         },
         this.maxOuterHtmlLength,
       );
-    } catch {
+    } catch (error) {
+      this.trace?.("picker.inspectNode.error", { nodeId, error: formatPickerError(error) });
       return undefined;
     }
   }
+}
+
+function formatPickerError(error: unknown): string {
+  return error instanceof Error ? `${error.message}` : String(error);
 }
 
 function boxFromModel(borderQuad: number[]) {

@@ -4,12 +4,9 @@ import * as path from "node:path";
 import { rm, unlink } from "node:fs/promises";
 
 import { registerBrowserBridgeSetupCommand } from "./browserBridgeSetup";
-import { DocsSearchClient } from "./services/docsSearchClient";
 import { WorkspaceState } from "./state/workspaceState";
 import { SelectionContextStore } from "./state/selectionContextStore";
 import { looksLikeUrl } from "./utils/url";
-import { DocsChatPanel } from "./panels/docsChatPanel";
-import { DocsResultsPanel } from "./panels/docsResultsPanel";
 import { startBrowserBridgeServer } from "./bridge/browserBridgeServer";
 import { LivePreviewManager } from "./panels/livePreviewManager";
 import { forceCleanupBrowserProfiles } from "./profile/browserProfilePath";
@@ -65,11 +62,8 @@ export function activate(context: vscode.ExtensionContext): void {
   const workspaceState = new WorkspaceState(context);
   const selectionContextStore = new SelectionContextStore();
   const previewManager = new LivePreviewManager(context, workspaceState, selectionContextStore);
-  let docsClient = DocsSearchClient.fromConfiguration();
-  const docsResultsPanel = new DocsResultsPanel(context, previewManager);
-  const docsChatPanel = new DocsChatPanel(context, workspaceState, docsClient, previewManager);
 
-  context.subscriptions.push(previewManager, docsResultsPanel, docsChatPanel, selectionContextStore);
+  context.subscriptions.push(previewManager, selectionContextStore);
 
   const actionTreeDataProvider = new ActionTreeDataProvider();
   vscode.window.registerTreeDataProvider("myPreview.actions", actionTreeDataProvider);
@@ -89,15 +83,6 @@ export function activate(context: vscode.ExtensionContext): void {
       context.subscriptions.push(bridge);
     }
   });
-
-  context.subscriptions.push(
-    vscode.workspace.onDidChangeConfiguration((event) => {
-      if (event.affectsConfiguration("myDocs")) {
-        docsClient = DocsSearchClient.fromConfiguration();
-        docsChatPanel.setDocsClient(docsClient);
-      }
-    }),
-  );
 
   // Open browser immediately with the last URL (or localhost:3000). No prompt.
   context.subscriptions.push(
@@ -198,81 +183,6 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.commands.registerCommand("myPreview.showDiagnostics", async () => {
       await previewManager.showDiagnostics();
-    }),
-  );
-
-  context.subscriptions.push(
-    vscode.commands.registerCommand("myDocs.search", async () => {
-      try {
-        const query = await vscode.window.showInputBox({
-          title: "Search docs or web",
-          prompt: "Ask a docs or web question",
-          ignoreFocusOut: true,
-        });
-
-        if (!query) {
-          return;
-        }
-
-        const response = await docsClient.search({ query, limit: 8 });
-        docsResultsPanel.show(response);
-      } catch (error) {
-        void vscode.window.showErrorMessage(error instanceof Error ? error.message : "Search failed.");
-      }
-    }),
-  );
-
-  context.subscriptions.push(
-    vscode.commands.registerCommand("myDocs.searchInDocs", async () => {
-      try {
-        const sources = docsClient.getConfiguredSources();
-
-        if (!sources.length) {
-          void vscode.window.showErrorMessage("Configure myDocs.defaultDocs before using scoped docs search.");
-          return;
-        }
-
-        const picked = await vscode.window.showQuickPick(
-          sources.map((source) => ({
-            label: source.name,
-            description: source.baseUrl,
-            source,
-          })),
-          {
-            title: "Choose a docs source",
-            ignoreFocusOut: true,
-          },
-        );
-
-        if (!picked) {
-          return;
-        }
-
-        const query = await vscode.window.showInputBox({
-          title: `Search in ${picked.source.name}`,
-          prompt: "Enter a docs query",
-          ignoreFocusOut: true,
-        });
-
-        if (!query) {
-          return;
-        }
-
-        const response = await docsClient.search({
-          query,
-          source: picked.source,
-          limit: 8,
-        });
-        docsResultsPanel.show(response);
-      } catch (error) {
-        void vscode.window.showErrorMessage(error instanceof Error ? error.message : "Scoped search failed.");
-      }
-    }),
-  );
-
-  context.subscriptions.push(
-    vscode.commands.registerCommand("myDocs.openChat", async () => {
-      await docsChatPanel.show();
     }),
   );
 }

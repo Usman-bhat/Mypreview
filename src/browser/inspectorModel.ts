@@ -79,6 +79,7 @@ export function buildElementReference(inspector: ElementInspectorData): ElementR
     computedStylesHash: inspector.computedStylesHash,
     box: inspector.box,
     pinnedAt: new Date().toISOString(),
+    attributes: inspector.attributes,
   };
 }
 

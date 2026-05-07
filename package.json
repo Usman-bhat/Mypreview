@@ -2,7 +2,7 @@
   "name": "mypreview",
   "displayName": "MyPreview",
   "description": "Bring the modern, agentic IDE browser experience directly into VS Code with CDP-backed live preview and element picking.",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "publisher": "MohammadUsman",
   "icon": "media/logo.png",
   "license": "MIT",
@@ -80,18 +80,6 @@
         "title": "My Preview: Clear Selected Elements"
       },
       {
-        "command": "myDocs.search",
-        "title": "My Docs: Search Docs Or Web"
-      },
-      {
-        "command": "myDocs.searchInDocs",
-        "title": "My Docs: Search In Specific Docs"
-      },
-      {
-        "command": "myDocs.openChat",
-        "title": "My Docs: Open Docs Chat"
-      },
-      {
         "command": "myPreview.showBrowserBridgeSetup",
         "title": "My Preview: Browser Bridge & MCP Setup"
       },
@@ -139,57 +127,8 @@
       ]
     },
     "configuration": {
-      "title": "My Preview And Docs",
+      "title": "My Preview",
       "properties": {
-        "myDocs.searchEndpoint": {
-          "type": "string",
-          "default": "http://127.0.0.1:47831/search",
-          "description": "Search API endpoint. The extension sends q, sourceName, and sourceBaseUrl query parameters by default."
-        },
-        "myDocs.apiKey": {
-          "type": "string",
-          "default": "",
-          "description": "Optional API key. Sent as both x-api-key and Bearer auth so it is easy to adapt to a real provider."
-        },
-        "myDocs.defaultDocs": {
-          "type": "array",
-          "description": "Named documentation sources used by myDocs.searchInDocs and Docs Chat.",
-          "default": [
-            {
-              "name": "React Docs",
-              "baseUrl": "https://react.dev"
-            },
-            {
-              "name": "Next.js Docs",
-              "baseUrl": "https://nextjs.org/docs"
-            },
-            {
-              "name": "MDN Web Docs",
-              "baseUrl": "https://developer.mozilla.org"
-            },
-            {
-              "name": "SwiftUI Docs",
-              "baseUrl": "https://developer.apple.com/documentation/swiftui"
-            }
-          ],
-          "items": {
-            "type": "object",
-            "required": [
-              "name",
-              "baseUrl"
-            ],
-            "properties": {
-              "name": {
-                "type": "string",
-                "description": "Human-friendly label shown in the UI."
-              },
-              "baseUrl": {
-                "type": "string",
-                "description": "Base URL or origin for the documentation set."
-              }
-            }
-          }
-        },
         "myPreview.browserExecutablePath": {
           "type": "string",
           "default": "",
@@ -234,15 +173,34 @@
         },
         "myPreview.jpegQuality": {
           "type": "number",
-          "default": 82,
+          "default": 92,
           "minimum": 40,
           "maximum": 100,
-          "description": "JPEG quality (40–100) when screenshotFormat is jpeg. Lower values are faster and smaller."
+          "description": "JPEG quality (40–100) when screenshotFormat is jpeg. Higher = sharper but heavier; default 92 is tuned for crisp retina rendering."
+        },
+        "myPreview.deviceScaleFactor": {
+          "type": "number",
+          "default": 2,
+          "minimum": 1,
+          "maximum": 3,
+          "description": "Device pixel ratio used when rendering the preview. 2 produces sharp retina‑quality screenshots; lower it to 1 for faster but blurrier rendering on slow machines."
         },
         "myPreview.maxOuterHtmlLength": {
           "type": "number",
           "default": 1200,
           "description": "Maximum sanitized outerHTML length included in copied AI context."
+        },
+        "myPreview.promoteSvgPicksToRoot": {
+          "type": "boolean",
+          "default": true,
+          "description": "When picking an element inside an SVG (e.g. path), paste the owning <svg> tag and path instead of huge path data."
+        },
+        "myPreview.maxAgentAttributeLength": {
+          "type": "number",
+          "default": 120,
+          "minimum": 32,
+          "maximum": 2000,
+          "description": "Max characters per HTML attribute in the pasted \"HTML Element:\" line (long SVG d= paths, data URLs, etc. are truncated)."
         },
         "myPreview.enableBrowserBridge": {
           "type": "boolean",

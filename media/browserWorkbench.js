@@ -33,13 +33,16 @@
   var selectionsList = document.getElementById("selectionsList");
   var clearSelections = document.getElementById("clearSelections");
   var pickButton = document.getElementById("pickButton");
+  var cssInspectorButton = document.getElementById("cssInspectorButton");
+  var componentsButton = document.getElementById("componentsButton");
+  var componentsPanel = document.getElementById("componentsPanel");
+  var componentsTree = document.getElementById("componentsTree");
+  var componentsClose = document.getElementById("componentsClose");
   
   var inspectHoverBox = document.getElementById("inspectHoverBox");
   var inspectTooltip = document.getElementById("inspectTooltip");
   
   // Cursor-style panels
-  var elementSelector = document.getElementById("elementSelector");
-  var elementSelectorInfo = document.getElementById("elementSelectorInfo");
   var cssInspector = document.getElementById("cssInspector");
   var cssInspectorContent = document.getElementById("cssInspectorContent");
   var devTools = document.getElementById("devTools");
@@ -170,12 +173,9 @@
     if (pickButton) pickButton.classList.add("active");
     if (menuPickElement) menuPickElement.classList.add("active");
     stage.classList.add("pick-active");
-    elementSelector.classList.remove("hidden");
-    // Hide old CDP overlay — the injected script draws its own highlight inside the page
     inspectHoverBox.classList.add("hidden");
     inspectTooltip.classList.add("hidden");
-    // Show instructional banner
-    messageBar.textContent = '\u2B50 Pick mode: click any element in the browser to insert its HTML at your editor cursor. Press Escape to cancel.';
+    messageBar.textContent = "Pick mode: click elements to send their DOM to the agent. Each click sends one element. Press Escape to exit.";
     messageBar.dataset.kind = '';
     messageBar.classList.remove('hidden');
     post("browser.togglePickMode", { active: true });
@@ -187,7 +187,6 @@
     if (pickButton) pickButton.classList.remove("active");
     if (menuPickElement) menuPickElement.classList.remove("active");
     stage.classList.remove("pick-active");
-    elementSelector.classList.add("hidden");
     inspectHoverBox.classList.add("hidden");
     inspectTooltip.classList.add("hidden");
     messageBar.classList.add('hidden');
@@ -205,13 +204,17 @@
     selectionsBar.classList.remove("hidden");
 
     selections.forEach(function (sel, idx) {
+      var tagName = sel.tag || sel.tagName || "element";
+      var textSnippet = sel.text || sel.textSnippet || "";
+      var classNames = Array.isArray(sel.classes) ? sel.classes : [];
+
       var chip = document.createElement("div");
       chip.className = "selection-chip";
       chip.title = sel.selector;
 
       var tagSpan = document.createElement("span");
       tagSpan.className = "chip-tag";
-      tagSpan.textContent = "<" + sel.tag + ">";
+      tagSpan.textContent = "<" + tagName + ">";
       chip.appendChild(tagSpan);
 
       if (sel.id) {
@@ -221,17 +224,17 @@
         chip.appendChild(idSpan);
       }
 
-      if (sel.classes && sel.classes.length > 0) {
+      if (classNames.length > 0) {
         var clsSpan = document.createElement("span");
         clsSpan.className = "chip-class";
-        clsSpan.textContent = "." + sel.classes.slice(0, 2).join(".");
+        clsSpan.textContent = "." + classNames.slice(0, 2).join(".");
         chip.appendChild(clsSpan);
       }
 
-      if (sel.text && !sel.id && sel.classes.length === 0) {
+      if (textSnippet && !sel.id && classNames.length === 0) {
         var textSpan = document.createElement("span");
         textSpan.className = "chip-text";
-        textSpan.textContent = '"' + sel.text.substring(0, 30) + '"';
+        textSpan.textContent = '"' + textSnippet.substring(0, 30) + '"';
         chip.appendChild(textSpan);
       }
 
@@ -245,6 +248,7 @@
 
       chip.addEventListener("click", function (e) {
         if (e.target === removeBtn) return;
+        selectedElement = sel;
         navigator.clipboard.writeText(sel.selector).then(function () {
           messageBar.textContent = "Copied: " + sel.selector;
           messageBar.dataset.kind = "";
@@ -255,6 +259,7 @@
 
       selectionsList.appendChild(chip);
     });
+    renderComponentsTree();
   }
 
   function addSelection(info) {
@@ -263,6 +268,80 @@
     selections.push(info);
     persist();
     renderSelections();
+  }
+
+  /* ── Components tree (DOM hierarchy of picked elements) ── */
+  function renderComponentsTree() {
+    if (!componentsTree) return;
+    componentsTree.innerHTML = "";
+
+    if (selections.length === 0) {
+      var empty = document.createElement("div");
+      empty.className = "components-empty";
+      empty.textContent = "Pick elements to see them here as a tree.";
+      componentsTree.appendChild(empty);
+      return;
+    }
+
+    selections.forEach(function (sel, idx) {
+      var node = document.createElement("div");
+      node.className = "component-node";
+      var depth = countSelectorDepth(sel.selector);
+      node.style.paddingLeft = (8 + depth * 10) + "px";
+
+      var tagName = (sel.tag || sel.tagName || "element").toLowerCase();
+      var tagSpan = document.createElement("span");
+      tagSpan.className = "component-node-tag";
+      tagSpan.textContent = tagName;
+      node.appendChild(tagSpan);
+
+      if (sel.id) {
+        var idSpan = document.createElement("span");
+        idSpan.className = "component-node-id";
+        idSpan.textContent = "#" + sel.id;
+        node.appendChild(idSpan);
+      }
+
+      var classes = Array.isArray(sel.classes) ? sel.classes : [];
+      if (classes.length > 0) {
+        var clsSpan = document.createElement("span");
+        clsSpan.className = "component-node-class";
+        clsSpan.textContent = "." + classes.slice(0, 2).join(".");
+        node.appendChild(clsSpan);
+      }
+
+      node.title = sel.selector || tagName;
+      node.addEventListener("click", function () {
+        selectedElement = sel;
+        if (navigator.clipboard && sel.selector) {
+          navigator.clipboard.writeText(sel.selector).catch(function () {});
+        }
+        Array.prototype.forEach.call(
+          componentsTree.querySelectorAll(".component-node.active"),
+          function (n) { n.classList.remove("active"); }
+        );
+        node.classList.add("active");
+      });
+
+      componentsTree.appendChild(node);
+    });
+  }
+
+  function countSelectorDepth(selector) {
+    if (typeof selector !== "string") return 0;
+    var parts = selector.split(">");
+    return Math.max(0, Math.min(6, parts.length - 1));
+  }
+
+  function toggleComponentsPanel(force) {
+    if (!componentsPanel) return;
+    var willOpen = typeof force === "boolean" ? force : componentsPanel.classList.contains("hidden");
+    if (willOpen) {
+      componentsPanel.classList.remove("hidden");
+      renderComponentsTree();
+    } else {
+      componentsPanel.classList.add("hidden");
+    }
   }
 
   function removeSelection(idx) {
@@ -393,16 +472,10 @@
   /* Enhanced Element Selection */
   function updateElementSelector(element) {
     if (!element) {
-      elementSelectorInfo.textContent = "No element selected";
+      selectedElement = null;
       return;
     }
-    
-    const tag = element.nodeName ? element.nodeName.toLowerCase() : "";
-    const id = element.id ? "#" + element.id : "";
-    const classes = element.classes && element.classes.length > 0 ? "." + element.classes.slice(0, 2).join(".") : "";
-    const selector = element.selector || tag + id + classes;
-    
-    elementSelectorInfo.textContent = selector;
+
     selectedElement = element;
   }
 
@@ -698,11 +771,53 @@
   if (menuToggleCssInspector) {
     menuToggleCssInspector.addEventListener("click", function () {
       closeMenu();
-      if (cssInspector.classList.contains("open")) {
-         closeCssInspector();
-      } else {
-         cssInspector.classList.add("open");
+      if (!selectedElement) {
+        messageBar.textContent = "Pick an element first, then use Inspect Selected Element.";
+        messageBar.dataset.kind = "";
+        messageBar.classList.remove("hidden");
+        return;
       }
+
+      if (cssInspector.classList.contains("open")) {
+        closeCssInspector();
+        return;
+      }
+
+      openCssInspector(selectedElement);
+    });
+  }
+
+  if (cssInspectorButton) {
+    cssInspectorButton.addEventListener("click", function (e) {
+      e.stopPropagation();
+      if (cssInspector.classList.contains("open")) {
+        closeCssInspector();
+        return;
+      }
+      var target = selectedElement || (selections.length > 0 ? selections[selections.length - 1] : null);
+      if (!target) {
+        messageBar.textContent = "Pick an element first, then click the inspector.";
+        messageBar.dataset.kind = "";
+        messageBar.classList.remove("hidden");
+        setTimeout(function () { messageBar.classList.add("hidden"); }, 2400);
+        return;
+      }
+      selectedElement = target;
+      openCssInspector(target);
+    });
+  }
+
+  if (componentsButton) {
+    componentsButton.addEventListener("click", function (e) {
+      e.stopPropagation();
+      toggleComponentsPanel();
+    });
+  }
+
+  if (componentsClose) {
+    componentsClose.addEventListener("click", function (e) {
+      e.stopPropagation();
+      toggleComponentsPanel(false);
     });
   }
 
@@ -747,29 +862,6 @@
   });
   document.getElementById("cssInspectorUndo").addEventListener("click", undoCssChange);
   document.getElementById("cssInspectorRedo").addEventListener("click", redoCssChange);
-
-  // Element Selector
-  document.getElementById("elementSelectBtn").addEventListener("click", function() {
-    if (selectedElement) {
-      addSelection(selectedElement);
-      cursorBridge("element-selected", { element: selectedElement });
-    }
-  });
-  document.getElementById("elementInspectBtn").addEventListener("click", function() {
-    if (selectedElement) {
-      openCssInspector(selectedElement);
-    }
-  });
-  document.getElementById("elementCopyBtn").addEventListener("click", function() {
-    if (selectedElement && selectedElement.selector) {
-      navigator.clipboard.writeText(selectedElement.selector).then(function() {
-        messageBar.textContent = "Copied: " + selectedElement.selector;
-        messageBar.dataset.kind = "";
-        messageBar.classList.remove("hidden");
-        setTimeout(function() { messageBar.classList.add("hidden"); }, 2000);
-      });
-    }
-  });
 
   // Dev Tools
   document.getElementById("devToolsClose").addEventListener("click", closeDevTools);
@@ -1042,8 +1134,6 @@
          }
       }
     } else if (msg.type === "browser.inspectHover") {
-      // In pick mode, the injected script draws its own overlay — suppress the CDP one.
-      if (pickMode) return;
       var p = msg.payload;
       if (!p || !p.box) {
          if (inspectHoverBox) inspectHoverBox.classList.add("hidden");
@@ -1120,12 +1210,27 @@
       }
     } else if (msg.type === "cursor.bridge.response") {
       // Responses are intentionally ignored unless the UI needs to display them.
+    } else if (msg.type === "browser.selectionContextChanged") {
+      selections = Array.isArray(msg.payload && msg.payload.selections) ? msg.payload.selections : [];
+      selectedElement = selections.length ? selections[selections.length - 1] : null;
+      persist();
+      renderSelections();
     } else if (msg.type === "browser.areaScreenshot") {
-      // Show screenshot in a lightbox overlay
       var p = msg.payload || {};
       if (p.dataUrl) {
-        showScreenshotLightbox(p.dataUrl);
+        messageBar.textContent = "Screenshot captured and copied for the IDE agent.";
+        messageBar.dataset.kind = "";
+        messageBar.classList.remove("hidden");
       }
+    } else if (msg.type === "browser.screenshotToast") {
+      var t = msg.payload || {};
+      var label = t.label || "Screenshot";
+      var shortcut = t.shortcut || "Ctrl+V";
+      messageBar.textContent =
+        "📸 " + label + " copied to clipboard. If it didn't appear in the agent textbox, click the chat input and press " + shortcut + ".";
+      messageBar.dataset.kind = "";
+      messageBar.classList.remove("hidden");
+      setTimeout(function () { messageBar.classList.add("hidden"); }, 6000);
     } else if (msg.type === "browser.state") {
       var p = msg.payload || {};
       if (p.error) {
@@ -1161,69 +1266,4 @@
   }
 
   post("browser.ready");
-
-  /* ── Screenshot Lightbox ── */
-  function showScreenshotLightbox(dataUrl) {
-    // Remove any existing lightbox
-    var existing = document.getElementById('screenshotLightbox');
-    if (existing) existing.remove();
-
-    var lb = document.createElement('div');
-    lb.id = 'screenshotLightbox';
-    lb.style.cssText = [
-      'position:fixed;top:0;left:0;right:0;bottom:0;',
-      'background:rgba(0,0,0,0.85);z-index:9999;',
-      'display:flex;flex-direction:column;align-items:center;justify-content:center;',
-      'gap:12px;'
-    ].join('');
-
-    var img = document.createElement('img');
-    img.src = dataUrl;
-    img.style.cssText = 'max-width:90%;max-height:75vh;border-radius:4px;box-shadow:0 8px 32px rgba(0,0,0,0.6);';
-
-    var btnRow = document.createElement('div');
-    btnRow.style.cssText = 'display:flex;gap:8px;';
-
-    var copyBtn = document.createElement('button');
-    copyBtn.textContent = 'Copy to Clipboard';
-    copyBtn.style.cssText = 'padding:8px 16px;background:#0e639c;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:13px;';
-    copyBtn.addEventListener('click', function() {
-      // Convert dataUrl to blob and write to clipboard
-      fetch(dataUrl).then(function(r) { return r.blob(); }).then(function(blob) {
-        navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]).then(function() {
-          copyBtn.textContent = 'Copied!';
-          setTimeout(function() { copyBtn.textContent = 'Copy to Clipboard'; }, 1500);
-        }).catch(function() {
-          // Fallback: just copy the URL string
-          navigator.clipboard.writeText(dataUrl);
-          copyBtn.textContent = 'URL Copied!';
-          setTimeout(function() { copyBtn.textContent = 'Copy to Clipboard'; }, 1500);
-        });
-      });
-    });
-
-    var downloadBtn = document.createElement('a');
-    downloadBtn.textContent = 'Download';
-    downloadBtn.href = dataUrl;
-    downloadBtn.download = 'screenshot-' + Date.now() + '.png';
-    downloadBtn.style.cssText = 'padding:8px 16px;background:#3c3c3c;color:#ccc;border:none;border-radius:4px;cursor:pointer;font-size:13px;text-decoration:none;display:inline-block;';
-
-    var closeBtn = document.createElement('button');
-    closeBtn.textContent = '✕ Close';
-    closeBtn.style.cssText = 'padding:8px 16px;background:transparent;color:#ccc;border:1px solid #555;border-radius:4px;cursor:pointer;font-size:13px;';
-    closeBtn.addEventListener('click', function() { lb.remove(); });
-
-    btnRow.appendChild(copyBtn);
-    btnRow.appendChild(downloadBtn);
-    btnRow.appendChild(closeBtn);
-
-    lb.appendChild(img);
-    lb.appendChild(btnRow);
-
-    lb.addEventListener('click', function(e) {
-      if (e.target === lb) lb.remove();
-    });
-
-    document.body.appendChild(lb);
-  }
 })();
